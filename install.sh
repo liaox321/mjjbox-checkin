@@ -1,37 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# install.sh - mjjbox 自动签到 安装 / 卸载 脚本（自动安装依赖 + 开机启动支持）
-# 使用方法：
-#   chmod +x install.sh
-#   ./install.sh
+# install.sh - mjjbox 自动签到 安装 / 卸载 脚本（下载 checkin.py）
+# - 默认以 root 运行（脚本会检查）
+# - 自动安装系统依赖（可选）
+# - 创建 venv 并安装 requests, beautifulsoup4
+# - 自动从远程下载 checkin.py（默认 URL 可修改）
+# - 写入明文 credentials.conf（username/password/serverchan）
+# - 创建 systemd timer（每天）与开机运行 service
 #
-# 功能：
-# - 交互式安装：创建安装目录、创建虚拟环境、安装 python 依赖
-# - 可选：自动安装系统依赖（按发行版选择包管理器）
-# - 可选：创建 systemd timer（每天运行）并创建一个在开机时运行一次的 service（开机启动）
-# - 支持填写明文 credentials（username/password/serverchan）
-# - 卸载：移除目录、systemd 单元
+# 使用：
+#   保存为 install.sh
+#   chmod +x install.sh
+#   su -    # 切换到 root
+#   ./install.sh
 
 DEFAULT_DIR="/opt/mjjbox_checkin"
-PYTHON_CMD="/usr/bin/python3"
+DEFAULT_CHECKIN_URL="https://raw.githubusercontent.com/liaox321/mjjbox-checkin/main/checkin.py"
 SERVICE_NAME="mjjbox-checkin.service"
 TIMER_NAME="mjjbox-checkin.timer"
 BOOT_SERVICE_NAME="mjjbox-checkin-at-boot.service"
 
-# ---------- helper ----------
+# ---------- root check ----------
+if [ "$(id -u)" -ne 0 ]; then
+  echo -e "\033[1;31m[ERROR]\033[0m 本脚本必须以 root 身份运行。请用 su - 切换到 root 或使用 sudo -i 后再运行。"
+  exit 1
+fi
+
 echoinfo(){ echo -e "\033[1;34m[INFO]\033[0m $*"; }
 echowarn(){ echo -e "\033[1;33m[WARN]\033[0m $*"; }
 echoerr(){ echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; }
-
-require_sudo() {
-  if [ "$(id -u)" -ne 0 ]; then
-    if ! command -v sudo >/dev/null 2>&1; then
-      echoerr "当前非 root 且系统没有 sudo，请切换到 root 或先安装 sudo。"
-      exit 1
-    fi
-  fi
-}
 
 detect_pkg_mgr() {
   if command -v apt-get >/dev/null 2>&1; then
@@ -54,36 +52,30 @@ detect_pkg_mgr() {
 install_system_deps() {
   PKG=$(detect_pkg_mgr)
   if [ -z "$PKG" ]; then
-    echowarn "未检测到支持的包管理器（apt/dnf/yum/pacman/apk/zypper）。请手动安装以下依赖：python3 python3-venv python3-pip curl"
+    echowarn "未检测到支持的包管理器（apt/dnf/yum/pacman/apk/zypper）。请手动安装：python3 python3-venv python3-pip curl/wget"
     return 1
   fi
 
-  echoinfo "检测到包管理器: $PKG，开始安装系统依赖（python3/venv/pip/curl）..."
+  echoinfo "检测到包管理器: $PKG，开始安装系统依赖（python3/venv/pip/curl/wget）..."
   case "$PKG" in
     apt)
-      SUDO_CMD="sudo"
-      $SUDO_CMD apt-get update -y
-      $SUDO_CMD apt-get install -y python3 python3-venv python3-pip curl || return 1
+      apt-get update -y
+      apt-get install -y python3 python3-venv python3-pip curl wget || return 1
       ;;
     dnf)
-      SUDO_CMD="sudo"
-      $SUDO_CMD dnf install -y python3 python3-venv python3-pip curl || return 1
+      dnf install -y python3 python3-venv python3-pip curl wget || return 1
       ;;
     yum)
-      SUDO_CMD="sudo"
-      $SUDO_CMD yum install -y python3 python3-venv python3-pip curl || return 1
+      yum install -y python3 python3-venv python3-pip curl wget || return 1
       ;;
     pacman)
-      SUDO_CMD="sudo"
-      $SUDO_CMD pacman -Sy --noconfirm python python-virtualenv python-pip curl || return 1
+      pacman -Sy --noconfirm python python-virtualenv python-pip curl wget || return 1
       ;;
     apk)
-      SUDO_CMD="sudo"
-      $SUDO_CMD apk add --no-cache python3 py3-virtualenv py3-pip curl || return 1
+      apk add --no-cache python3 py3-virtualenv py3-pip curl wget || return 1
       ;;
     zypper)
-      SUDO_CMD="sudo"
-      $SUDO_CMD zypper install -y python3 python3-virtualenv python3-pip curl || return 1
+      zypper install -y python3 python3-virtualenv python3-pip curl wget || return 1
       ;;
     *)
       echowarn "未知包管理器: $PKG，请手动安装依赖"
@@ -94,7 +86,6 @@ install_system_deps() {
   return 0
 }
 
-# ---------- main actions ----------
 show_menu() {
   cat <<EOF
 请选择操作:
@@ -110,17 +101,31 @@ EOF
   esac
 }
 
+download_checkin_py() {
+  local url="$1"
+  local dest="$2"
+  # prefer curl, fallback to wget
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$dest" || return 1
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$dest" "$url" || return 1
+  else
+    return 2
+  fi
+  chmod +x "$dest"
+  return 0
+}
+
 do_install() {
   read -rp "安装目录 (默认: ${DEFAULT_DIR}): " INST_DIR
   INST_DIR=${INST_DIR:-$DEFAULT_DIR}
 
-  read -rp "是否自动尝试安装系统依赖（python3/venv/pip/curl）？(Y/n): " AUTO_SYS
+  read -rp "是否自动尝试安装系统依赖（python3/venv/pip/curl/wget）？(Y/n): " AUTO_SYS
   AUTO_SYS=${AUTO_SYS:-Y}
 
   if [[ "$AUTO_SYS" =~ ^([yY])$ ]]; then
-    require_sudo
     if ! install_system_deps; then
-      echowarn "自动安装系统依赖失败或不完整，请根据提示手动安装后再运行本脚本。"
+      echowarn "自动安装系统依赖失败或不完整，请手动安装后再运行本脚本，或选择跳过。"
       read -rp "是否继续（跳过系统依赖安装）？(y/N): " cont
       if [[ ! "$cont" =~ ^([yY])$ ]]; then
         echoinfo "取消安装。"
@@ -129,7 +134,7 @@ do_install() {
     fi
   fi
 
-  # 尝试寻找可用的 python 可执行文件
+  # 找 python3
   if command -v python3 >/dev/null 2>&1; then
     PYBIN="$(command -v python3)"
   else
@@ -142,8 +147,10 @@ do_install() {
   fi
 
   echoinfo "创建安装目录: $INST_DIR"
-  sudo mkdir -p "$INST_DIR"
-  sudo chown "$(whoami):$(whoami)" "$INST_DIR"
+  mkdir -p "$INST_DIR"
+  # try to set owner to the original login user if possible
+  OWNER="$(logname 2>/dev/null || echo root)"
+  chown "$OWNER:$OWNER" "$INST_DIR" || true
 
   echoinfo "创建 Python 虚拟环境..."
   "$PYBIN" -m venv "$INST_DIR/venv"
@@ -154,18 +161,24 @@ do_install() {
   pip install --upgrade pip >/dev/null
   pip install requests beautifulsoup4 >/dev/null
 
-  echoinfo "写入 checkin.py 到 $INST_DIR/checkin.py"
-  # 这里写入最新的 checkin.py 代码（请根据需要替换或直接覆盖）
-  cat > "$INST_DIR/checkin.py" <<'PYEOF'
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-# 请把你之前确认的完整 checkin.py 内容放在这里，或在安装完成后用我提供的最新 checkin.py 覆盖此文件。
-# 为避免脚本过长，此处是占位文本；install 完成后请确保 checkin.py 为最新版本并 chmod +x。
-# 如果你希望本脚本自动写入完整 checkin.py，请告诉我我可以把完整代码嵌入此文件。
-PYEOF
+  # 获取 checkin.py URL
+  read -rp "请输入 checkin.py 的下载 URL (默认: ${DEFAULT_CHECKIN_URL}): " CHECKIN_URL
+  CHECKIN_URL=${CHECKIN_URL:-$DEFAULT_CHECKIN_URL}
 
-  chmod +x "$INST_DIR/checkin.py"
+  echoinfo "从 ${CHECKIN_URL} 下载 checkin.py 到 ${INST_DIR}/checkin.py ..."
+  dl_ret=0
+  download_checkin_py "$CHECKIN_URL" "${INST_DIR}/checkin.py" || dl_ret=$?
+  if [ "$dl_ret" -eq 2 ]; then
+    echoerr "系统中既没有 curl 也没有 wget，无法下载 checkin.py。请先安装 curl 或 wget。"
+    exit 1
+  elif [ "$dl_ret" -ne 0 ]; then
+    echoerr "下载 checkin.py 失败（URL: ${CHECKIN_URL}）。请检查 URL 或手动把 checkin.py 放到 ${INST_DIR}/checkin.py"
+    exit 1
+  fi
 
+  echoinfo "checkin.py 下载并设置为可执行: ${INST_DIR}/checkin.py"
+
+  # 写入凭据文件
   echoinfo "准备写入凭据文件 (明文)：$INST_DIR/credentials.conf"
   read -rp "用户名 (username/email): " USERNAME
   read -s -rp "密码 (注意：将以明文保存): " PASSWORD
@@ -196,20 +209,20 @@ CRED
 
   if [[ "$ENABLE_TIMER" =~ ^([yY])$ ]]; then
     echoinfo "写入 systemd unit: ${SERVICE_NAME} 与 timer: ${TIMER_NAME}"
-    sudo bash -c "cat > /etc/systemd/system/${SERVICE_NAME}" <<SVC
+    cat > /etc/systemd/system/${SERVICE_NAME} <<SVC
 [Unit]
 Description=mjjbox auto checkin
 After=network-online.target
 
 [Service]
 Type=oneshot
-User=$(whoami)
+User=${OWNER}
 WorkingDirectory=${INST_DIR}
 ExecStart=${INST_DIR}/venv/bin/python ${INST_DIR}/checkin.py --cred ${INST_DIR}/credentials.conf
 TimeoutStartSec=120
 SVC
 
-    sudo bash -c "cat > /etc/systemd/system/${TIMER_NAME}" <<TMR
+    cat > /etc/systemd/system/${TIMER_NAME} <<TMR
 [Unit]
 Description=Run mjjbox checkin daily
 
@@ -222,9 +235,9 @@ Persistent=true
 WantedBy=timers.target
 TMR
 
-    sudo systemctl daemon-reload
+    systemctl daemon-reload
     echoinfo "启用并启动 timer: ${TIMER_NAME}"
-    sudo systemctl enable --now ${TIMER_NAME}
+    systemctl enable --now ${TIMER_NAME}
   else
     echoinfo "跳过创建 systemd timer。你可以手动运行: ${INST_DIR}/venv/bin/python ${INST_DIR}/checkin.py --cred ${INST_DIR}/credentials.conf"
   fi
@@ -232,14 +245,14 @@ TMR
   # 创建开机运行一次的 service（enable 使其在开机时运行）
   if [[ "$ENABLE_BOOT" =~ ^([yY])$ ]]; then
     echoinfo "创建开机启动 service: ${BOOT_SERVICE_NAME}"
-    sudo bash -c "cat > /etc/systemd/system/${BOOT_SERVICE_NAME}" <<BSVC
+    cat > /etc/systemd/system/${BOOT_SERVICE_NAME} <<BSVC
 [Unit]
 Description=mjjbox auto checkin at boot
 After=network-online.target
 
 [Service]
 Type=oneshot
-User=$(whoami)
+User=${OWNER}
 WorkingDirectory=${INST_DIR}
 ExecStart=${INST_DIR}/venv/bin/python ${INST_DIR}/checkin.py --cred ${INST_DIR}/credentials.conf
 TimeoutStartSec=120
@@ -248,19 +261,18 @@ TimeoutStartSec=120
 WantedBy=multi-user.target
 BSVC
 
-    sudo systemctl daemon-reload
-    # 启用开机启动（会在下次开机自动运行）。同时这里也尝试立即启动一次（可选）
-    echoinfo "启用 ${BOOT_SERVICE_NAME}（下次开机将运行）；同时立即运行一次测试..."
-    sudo systemctl enable ${BOOT_SERVICE_NAME} || true
-    sudo systemctl start ${BOOT_SERVICE_NAME} || echowarn "启动 ${BOOT_SERVICE_NAME} 失败（查看 systemctl status 获取日志）"
+    systemctl daemon-reload
+    echoinfo "启用 ${BOOT_SERVICE_NAME}（下次开机将运行）；同时尝试立即运行一次测试..."
+    systemctl enable ${BOOT_SERVICE_NAME} || echowarn "启用 ${BOOT_SERVICE_NAME} 失败"
+    systemctl start ${BOOT_SERVICE_NAME} || echowarn "立即启动 ${BOOT_SERVICE_NAME} 失败（查看 journal 获取日志）"
   fi
 
-  echoinfo "安装已完成。请检查并替换 $INST_DIR/checkin.py 为最新脚本（如果此处为占位），并确保权限为可执行。"
-  echoinfo "运行测试（debug 模式）:"
-  echo "  $INST_DIR/venv/bin/python $INST_DIR/checkin.py --cred $INST_DIR/credentials.conf --debug"
-  echoinfo "查看 timer 状态: sudo systemctl status ${TIMER_NAME}"
-  echoinfo "查看开机服务状态: sudo systemctl status ${BOOT_SERVICE_NAME}"
-  echoinfo "如果想修改定时任务时间，编辑 /etc/systemd/system/${TIMER_NAME} 后执行: sudo systemctl daemon-reload"
+  echoinfo "安装已完成。"
+  echoinfo "你可以用下面命令测试（带 debug 输出）:"
+  echo "  ${INST_DIR}/venv/bin/python ${INST_DIR}/checkin.py --cred ${INST_DIR}/credentials.conf --debug"
+  echoinfo "查看 timer 状态: systemctl status ${TIMER_NAME}"
+  echoinfo "查看开机服务状态: systemctl status ${BOOT_SERVICE_NAME}"
+  echoinfo "如需修改定时任务时间，编辑 /etc/systemd/system/${TIMER_NAME} 后执行: systemctl daemon-reload"
 }
 
 do_uninstall() {
@@ -277,20 +289,20 @@ do_uninstall() {
 
   echoinfo "停止并移除 systemd 单元（如果存在）..."
   if systemctl list-units --full -all | grep -q "${TIMER_NAME}"; then
-    sudo systemctl disable --now ${TIMER_NAME} || true
+    systemctl disable --now ${TIMER_NAME} || true
   fi
   if systemctl list-units --full -all | grep -q "${SERVICE_NAME}"; then
-    sudo systemctl disable --now ${SERVICE_NAME} || true
+    systemctl disable --now ${SERVICE_NAME} || true
   fi
   if systemctl list-units --full -all | grep -q "${BOOT_SERVICE_NAME}"; then
-    sudo systemctl disable --now ${BOOT_SERVICE_NAME} || true
+    systemctl disable --now ${BOOT_SERVICE_NAME} || true
   fi
-  sudo rm -f /etc/systemd/system/${SERVICE_NAME} /etc/systemd/system/${TIMER_NAME} /etc/systemd/system/${BOOT_SERVICE_NAME} || true
-  sudo systemctl daemon-reload || true
+  rm -f /etc/systemd/system/${SERVICE_NAME} /etc/systemd/system/${TIMER_NAME} /etc/systemd/system/${BOOT_SERVICE_NAME} || true
+  systemctl daemon-reload || true
 
   if [ -d "$INST_DIR" ]; then
     echoinfo "删除安装目录 $INST_DIR ..."
-    sudo rm -rf "$INST_DIR"
+    rm -rf "$INST_DIR"
   else
     echoinfo "安装目录不存在: $INST_DIR"
   fi
@@ -299,8 +311,5 @@ do_uninstall() {
 }
 
 # entry
-if [ "$(id -u)" -eq 0 ]; then
-  echowarn "注意：建议以普通用户运行此脚本（会在需要时使用 sudo 提权）。"
-fi
-
+echowarn "本脚本将以 root 身份直接执行系统级安装/配置。请确保你了解凭据将以明文保存在安装目录下。"
 show_menu
